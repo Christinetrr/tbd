@@ -22,12 +22,14 @@ import collections
 import logging
 import re
 import subprocess
+import time
 from typing import Optional
 
 import cv2
 import numpy as np
 from deepface import DeepFace
 
+from .api import summarize_frames
 
 def preprocess_frame(frame):
     """preprocess video frame to reduce noise and normalize to grayscale"""
@@ -98,6 +100,8 @@ def webcam_processing(camera_source=0, display_window: bool = False):
         raise RuntimeError(f"Unable to open camera source {camera_source!r}")
 
     scene_detector = SceneChangeDetector()
+    frames_buffer: list[np.ndarray] = []
+    period_start = time.time()
     # reads frames from webcam and projects
     while True:
         ok, frame = cap.read()
@@ -119,13 +123,21 @@ def webcam_processing(camera_source=0, display_window: bool = False):
         # only record frames when significant scene change is detected
         if scene_detector.detect(frame, gray):
             print("detected scene change", frame)
-            record_frame(frame)
+            frames_buffer.append(frame.copy())
+
+        if frames_buffer and (time.time() - period_start) >= 3600:
+            process_frame_batch(frames_buffer)
+            frames_buffer.clear()
+            period_start = time.time()
 
         # if familiar face detected, run the facial recognition process and record conversation
         if face_detected(frame):
             process_face(frame)
         else:
             continue
+
+    if frames_buffer:
+        process_frame_batch(frames_buffer)
 
     cap.release()
     if display_window:
@@ -187,6 +199,14 @@ def scan_camera_indices(limit: int = 10):
         else:
             cap.release()
     return first_index
+
+#summarizes batch of frames and store summary in database with timestamp
+def process_frame_batch(frames):
+    summary = summarize_frames(frames)
+    record_frames(frames, summary)
+
+def record_frames(frames, summary):
+    pass
 
 #facial similarity check
 def face_detected(frame):
