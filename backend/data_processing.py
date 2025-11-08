@@ -18,3 +18,24 @@ process livefeed data from webcam
     iii) summarized audio data associated with relevant profile
     iv) facial profiles 
 '''
+import cv2
+
+
+def webcam_processing():
+#change the indice to the webcam index
+cap = cv2.VideoCapture(0)
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        cv2.imshow("BRIO feed", frame)
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            break
+
+
+def main():
+    webcam_processing()
+
+if __name__ == "__main__":
+    main()
