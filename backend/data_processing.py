@@ -23,13 +23,29 @@ import logging
 import re
 import subprocess
 import time
+from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
 from deepface import DeepFace
+from dotenv import load_dotenv
 
-from .api import summarize_frames
+load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+
+try:
+    from backend.api import summarize_frames
+    from backend.db import append_timeline_event
+except ImportError:
+    import pathlib
+    import sys
+
+    backend_dir = pathlib.Path(__file__).resolve().parent
+    if str(backend_dir) not in sys.path:
+        sys.path.append(str(backend_dir))
+
+    from api import summarize_frames
+    from db import append_timeline_event
 
 def preprocess_frame(frame):
     """preprocess video frame to reduce noise and normalize to grayscale"""
@@ -206,7 +222,7 @@ def process_frame_batch(frames):
     record_frames(frames, summary)
 
 def record_frames(frames, summary):
-    pass
+    append_timeline_event(summary)
 
 #facial similarity check
 def face_detected(frame):
@@ -236,8 +252,7 @@ def process_face(frame):
 
 
 def record_frame(frame):
-    #record frame to database
-    pass
+    append_timeline_event("frame captured")
 
 
 def main():
