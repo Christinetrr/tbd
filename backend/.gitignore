@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+logs/
+
+# Database files
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+
+# Vector store files
+*.pkl
+*.pickle
+
+# Environment variables
+.env
+.env.local
+
+# macOS
+.DS_Store
+
+# Model checkpoints
+models/
+checkpoints/
+*.pt
+*.pth
+*.h5
+*.ckpt
+
+# Data files
+data/
+raw_data/
+temp/
+tmp/
+
+# Config with secrets (keep example only)
+config.json

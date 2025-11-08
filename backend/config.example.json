@@ -1,0 +1,54 @@
+{
+  "video": {
+    "camera_id": 0,
+    "fps": 30,
+    "resolution": [640, 480],
+    "motion_threshold": 25.0,
+    "min_motion_area": 500,
+    "enable_color_normalization": true,
+    "enable_temporal_smoothing": true,
+    "enable_background_subtraction": true,
+    "temporal_window_size": 5
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "chunk_size": 1024,
+    "channels": 1,
+    "energy_threshold": 500.0,
+    "enable_noise_reduction": true,
+    "enable_advanced_vad": true,
+    "noise_reduction_strength": 0.5
+  },
+  "face_detection": {
+    "detector_type": "haar",
+    "min_confidence": 0.9,
+    "min_face_size": [20, 20],
+    "embedding_model": "facenet",
+    "similarity_threshold": 0.6
+  },
+  "transcription": {
+    "model_name": "base",
+    "language": "en"
+  },
+  "llm": {
+    "api_key": null,
+    "model": "gpt-3.5-turbo",
+    "max_tokens": 150
+  },
+  "persistence": {
+    "mongodb_connection_string": "mongodb://localhost:27017/",
+    "mongodb_database_name": "livefeed_db",
+    "vector_store_path": "face_embeddings.pkl",
+    "conversation_buffer_ttl_minutes": 30,
+    "auto_cleanup_interval_seconds": 300
+  },
+  "pipeline": {
+    "video_queue_size": 30,
+    "audio_queue_size": 100,
+    "max_workers": 4,
+    "frame_processing_batch_size": 1,
+    "audio_processing_batch_size": 5,
+    "enable_scene_detection": true,
+    "scene_change_threshold": 30.0
+  }
+}

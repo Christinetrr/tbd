@@ -1,0 +1,26 @@
+# Core dependencies
+numpy>=1.24.0
+opencv-python>=4.8.0
+
+# Audio processing
+pyaudio>=0.2.13
+scipy>=1.11.0
+webrtcvad>=2.0.10  # Optional: advanced VAD
+
+# Deep learning & face recognition
+mtcnn>=0.1.1  # Optional: MTCNN face detection
+# keras-facenet  # Optional: FaceNet embeddings
+# onnxruntime  # Optional: for ONNX models
+
+# Speech-to-text
+openai-whisper>=20230314  # Whisper for transcription
+
+# LLM integration
+openai>=1.0.0  # For GPT-based summarization
+
+# Database & storage
+pymongo>=4.6.0  # MongoDB driver
+# faiss-cpu  # Optional: for better vector search
+
+# Utilities
+python-dotenv>=1.0.0  # For environment variables
