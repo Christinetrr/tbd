@@ -26,6 +26,7 @@ from typing import Optional
 
 import cv2
 import numpy as np
+from deepface import DeepFace
 
 
 def preprocess_frame(frame):
@@ -130,7 +131,7 @@ def webcam_processing(camera_source=0, display_window: bool = False):
     if display_window:
         cv2.destroyAllWindows()
 
-
+#find the camera device
 def _parse_v4l2_devices(raw_output: str) -> dict[str, list[str]]:
     devices = {}
     current_device = None
@@ -190,8 +191,24 @@ def scan_camera_indices(limit: int = 10):
 #facial similarity check
 def face_detected(frame):
     #detect face in frame using deepface library
+    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    try:
+        detections = DeepFace.extract_faces(
+            img_path=rgb_frame,
+            detector_backend="retinaface",
+            enforce_detection=False,
+        )
+    except Exception as exc:
+        print(f"DeepFace detection error: {exc}")
+        return False
+
+    has_face = bool(detections)
+    if has_face:
+        print(True)
+    return has_face
+
     #compare with similarity from database recorded facial profiles
-    pass
+
 #run live audio processing, send to LLM for summarization, process text, store
 def process_face(frame):
     #process face in frame
@@ -210,6 +227,7 @@ def main():
         raise RuntimeError("No usable camera source detected.")
 
     logging.info("Opening camera source %r", camera_source)
+    #start the webcam processing
     webcam_processing(camera_source=camera_source, display_window=False)
 
 if __name__ == "__main__":
