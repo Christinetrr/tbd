@@ -7,6 +7,7 @@ from typing import Iterable
 import cv2
 import numpy as np
 from openai import OpenAI
+import logging
 
 
 def _load_env_from_file():
@@ -102,28 +103,30 @@ def summarize_audio(audio_file):
     if audio_file is None:
         raise ValueError("audio file missing")
 
+    # 1) Transcribe with Whisper
     transcription = openai_client.audio.transcriptions.create(
         model="whisper-1",
         file=audio_file,
     )
+    text = transcription.text
 
-    response = xai_client.chat.completions.create(
+    # 2) Summarize with Grok (sequential: uses the text above)
+    completion = xai_client.chat.completions.create(
         model="grok-3",
         messages=[
             {
                 "role": "system",
-                "content": "You are an expert audio analysis system. Given a transcription of an audio file, your task is to summarize the essential events, actions, and scene transitions that occur. Focus on clarity, temporal flow, and relevance—omit redundant details. Output a concise natural-language summary that captures what happens across the audio, preserving order and context.",
+                "content": (
+                    "Given the following transcription text, create a concise summary "
+                    "of the conversation. Use at most 3 sentences. "
+                    "Be very concise and ONLY output plain text."
+                ),
             },
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "input_text",
-                        "text": transcription.text,
-                    },
-                ],
+                "content": text,  # <-- plain string; no input_text wrapper
             },
         ],
     )
 
-    return response.choices[0].message.content.strip()
+    return completion.choices[0].message.content.strip()

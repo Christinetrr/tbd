@@ -35,6 +35,7 @@ import sounddevice as sd
 import webrtcvad
 import threading
 import wave
+import os
 
 try:
     from .api import summarize_frames, summarize_audio
@@ -46,6 +47,11 @@ try:
 except ImportError:  # pragma: no cover - allows running as script
     from db import add_conversation, ensure_profile
 
+try:
+    from .elevenlabs_client import PCM_SAMPLE_RATE, text_to_speech
+except ImportError:  # pragma: no cover - allows running as script
+    from elevenlabs_client import PCM_SAMPLE_RATE, text_to_speech
+
 #initialize face cascade
 FACE_CASCADE = cv2.CascadeClassifier(
     cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -54,9 +60,29 @@ _FAMILIAR_URL = "https://64aa23c1f114.ngrok-free.app/recognize"
 AUDIO_OUTPUT_DIR = Path(__file__).resolve().parent / "recordings"
 
 START_TALKING_FLAG = False
+FACE_DETECTED_FLAG = False
 ACTIVE_PROFILE_CONTEXT: Optional[dict] = None
 LAST_RECOGNIZED_ID: Optional[str] = None
 LAST_ANNOUNCED_ID: Optional[str] = None
+
+MIN_CAPTURE_SECONDS = 2.0
+
+
+def _play_pcm_audio(audio_bytes: bytes, sample_rate: int = PCM_SAMPLE_RATE) -> None:
+    if not audio_bytes:
+        return
+    if sd is None:
+        logging.warning("sounddevice not available; cannot play identity audio.")
+        return
+    audio_array = np.frombuffer(audio_bytes, dtype=np.int16)
+    if audio_array.size == 0:
+        return
+    try:
+        sd.stop()
+        sd.play(audio_array.astype(np.float32) / 32768.0, sample_rate)
+        sd.wait()
+    except Exception as exc:  # pragma: no cover - hardware dependent
+        logging.warning("Unable to play ElevenLabs audio: %s", exc)
 
 
 class AudioRecorder:
@@ -141,7 +167,7 @@ def stop_audio_capture() -> Optional[Path]:
         return None
     file_path = _persist_audio(data, _audio_recorder.sample_rate, _audio_recorder.channels)
     if file_path:
-        logging.info("Saved audio capture to %s", file_path)
+        logging.info("DONE. Saved audio capture to %s", file_path)
     return file_path
 
 
@@ -223,6 +249,8 @@ def webcam_processing(camera_source=0, display_window: bool = False):
     period_start = time.time()
     was_face_detected = False
     capturing_audio = False
+    FACE_DETECTED_FLAG = False
+    capture_start_time: Optional[float] = None
     # reads frames from webcam and projects
     while True:
         ok, frame = cap.read()
@@ -243,17 +271,27 @@ def webcam_processing(camera_source=0, display_window: bool = False):
 
 
         face_present = face_detected(gray_scaled_frame)
+        #if a new face is detected, BEGIN CONVERSATION RECORDING (so we do not spam the same frame during the conversation)
         if face_present and not was_face_detected:
+            FACE_DETECTED_FLAG = False
             snapshot = frame.copy()
             familiar_result = None
             try:
                 familiar_result = find_familiar(snapshot)
+                #if face is detected, we want to flag that and start recording
+                if _is_familiar_match(familiar_result):
+                    FACE_DETECTED_FLAG = True
+                    START_TALKING_FLAG = True
                 logging.info("Familiar face check: %s", familiar_result)
             except Exception as exc:
                 logging.warning("find_familiar failed: %s", exc)
+                FACE_DETECTED_FLAG = False
             
-            if familiar_result and not capturing_audio and _is_familiar_match(familiar_result):
-                START_TALKING_FLAG = True
+            #begin conversation recording
+            print(f"FACE_DETECTED_FLAG: {FACE_DETECTED_FLAG}\n")
+            print(f"START_TALKING_FLAG: {START_TALKING_FLAG}\n")
+            print(f"capturing_audio: {capturing_audio}\n")
+            if FACE_DETECTED_FLAG and START_TALKING_FLAG and not capturing_audio:
                 ACTIVE_PROFILE_CONTEXT = _extract_profile_context(familiar_result)
                 identity_key = _context_identity(ACTIVE_PROFILE_CONTEXT)
                 if identity_key and identity_key != LAST_RECOGNIZED_ID:
@@ -263,15 +301,28 @@ def webcam_processing(camera_source=0, display_window: bool = False):
                     LAST_RECOGNIZED_ID = identity_key
                 if start_audio_capture():
                     capturing_audio = True
-                    logging.info("Audio capture engaged for familiar face.")
+                    capture_start_time = time.time()
+                    logging.info("AUDIO CAPTURE ENGAGED FOR FAMILIAR FACE.")
+                #on an error, stop recording and reset flags
                 else:
                     stop_audio_capture()
                     capturing_audio = False
                     START_TALKING_FLAG = False
+                    FACE_DETECTED_FLAG = False
                     ACTIVE_PROFILE_CONTEXT = None
-        if capturing_audio and not audio_detected():
+                    capture_start_time = None
+
+        print(f"audio_detected: {audio_detected()}\n")
+        #CONVERSATION STOPS
+        if (
+            capturing_audio
+            and capture_start_time is not None
+            and (time.time() - capture_start_time) >= MIN_CAPTURE_SECONDS
+            and not audio_detected()
+        ):
             audio_file = stop_audio_capture()
             capturing_audio = False
+            capture_start_time = None
             START_TALKING_FLAG = False
             _process_captured_audio(ACTIVE_PROFILE_CONTEXT, audio_file)
             ACTIVE_PROFILE_CONTEXT = None
@@ -404,6 +455,7 @@ class _VadSpeechDetector:
         aggressiveness: int = 3,
         #length of silence to consider the user as not speaking
         max_silence_ms: int = 3000,
+        energy_threshold: float = 7000.0,
     ):
         if webrtcvad is None:
             raise RuntimeError("webrtcvad library not available.")
@@ -413,6 +465,7 @@ class _VadSpeechDetector:
         self.frame_samples = int(sample_rate * frame_duration_ms / 1000)
         self.frame_bytes = self.frame_samples * 2  # int16
         self.max_silence_frames = max(int(max_silence_ms / frame_duration_ms), 1)
+        self.energy_threshold = energy_threshold
         self._vad = webrtcvad.Vad(min(max(aggressiveness, 0), 3))
         self._queue: queue.Queue[bytes] = queue.Queue()
         self._stream: Optional[sd.InputStream] = None
@@ -456,13 +509,24 @@ class _VadSpeechDetector:
             if len(chunk) < self.frame_bytes:
                 # pad short frames (e.g., last partial frame) with zeros
                 chunk = chunk + b"\x00" * (self.frame_bytes - len(chunk))
-            is_speech = self._vad.is_speech(chunk, self.sample_rate)
+            audio_samples = np.frombuffer(chunk, dtype=np.int16)
+            energy = float(np.mean(np.abs(audio_samples))) if audio_samples.size else 0.0
+            if energy < self.energy_threshold:
+                is_speech = False
+            else:
+                is_speech = self._vad.is_speech(chunk, self.sample_rate)
 
             if is_speech:
                 self._silence_counter = 0
                 updated_speaking_state = True
             elif self._is_speaking:
                 self._silence_counter += 1
+                logging.debug(
+                    "Silence counter: %s/%s (threshold crossed: %s)",
+                    self._silence_counter,
+                    self.max_silence_frames,
+                    self._silence_counter >= self.max_silence_frames,
+                )
                 if self._silence_counter >= self.max_silence_frames:
                     updated_speaking_state = False
                     self._silence_counter = 0
@@ -564,6 +628,7 @@ def _process_captured_audio(context: Optional[dict], file_path: Optional[Path]) 
         logging.warning("Failed to summarize audio %s: %s", file_path, exc)
         return
     _store_conversation_summary(context, summary)
+    _speak_summary(summary)
 
 
 def _context_identity(context: Optional[dict]) -> Optional[str]:
@@ -585,9 +650,21 @@ def _announce_identity(context: Optional[dict]) -> None:
     relation = context.get("relation") or "friend"
     message = f"This is {name}, and she is your {relation}."
     try:
-        subprocess.run(["espeak", message], check=False)
-    except FileNotFoundError:
-        logging.warning("espeak not available; cannot announce familiar identity.")
+        audio_bytes = text_to_speech(message)
+        _play_pcm_audio(audio_bytes)
+    except Exception as exc:  # pragma: no cover - external service
+        logging.warning("ElevenLabs announcement failed: %s", exc)
+
+
+def _speak_summary(summary: str) -> None:
+    if not summary:
+        return
+    try:
+        pronounced_summary = f"Conversation summary: {summary}"
+        audio_bytes = text_to_speech(pronounced_summary)
+        _play_pcm_audio(audio_bytes)
+    except Exception as exc:  # pragma: no cover - external service
+        logging.warning("ElevenLabs summary playback failed: %s", exc)
 
 
 def main():
