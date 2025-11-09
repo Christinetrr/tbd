@@ -20,32 +20,132 @@ process livefeed data from webcam
 '''
 import collections
 import logging
+import queue
 import re
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import cv2
 import numpy as np
-from deepface import DeepFace
-from dotenv import load_dotenv
-
-load_dotenv(Path(__file__).resolve().parents[1] / ".env", override=False)
+import requests
+import sounddevice as sd
+import webrtcvad
+import threading
+import wave
 
 try:
-    from backend.api import summarize_frames
-    from backend.db import append_timeline_event
-except ImportError:
-    import pathlib
-    import sys
-
-    backend_dir = pathlib.Path(__file__).resolve().parent
-    if str(backend_dir) not in sys.path:
-        sys.path.append(str(backend_dir))
-
+    from .api import summarize_frames
+except ImportError:  # pragma: no cover - allows running as script
     from api import summarize_frames
-    from db import append_timeline_event
+
+#initialize face cascade
+FACE_CASCADE = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
+_FAMILIAR_URL = "https://64aa23c1f114.ngrok-free.app/recognize"
+AUDIO_OUTPUT_DIR = Path(__file__).resolve().parent / "recordings"
+
+START_TALKING_FLAG = False
+
+
+class AudioRecorder:
+    def __init__(self, sample_rate: int = 16_000, channels: int = 1):
+        self.sample_rate = sample_rate
+        self.channels = channels
+        self._stream: Optional[sd.InputStream] = None
+        self._buffer = bytearray()
+        self._lock = threading.Lock()
+
+    def _callback(self, indata, _frames, _time, status):
+        if status:
+            logging.debug("Audio stream status: %s", status)
+        with self._lock:
+            self._buffer.extend(bytes(indata))
+
+    def start(self):
+        if sd is None:
+            raise RuntimeError("sounddevice library not available; cannot capture audio.")
+        if self._stream is not None:
+            return
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=self.channels,
+            dtype="int16",
+            callback=self._callback,
+        )
+        self._stream.start()
+        logging.info("Audio capture started.")
+
+    def stop(self) -> bytes:
+        if self._stream is None:
+            return b""
+        self._stream.stop()
+        self._stream.close()
+        self._stream = None
+        with self._lock:
+            data = bytes(self._buffer)
+            self._buffer.clear()
+        logging.info("Audio capture stopped.")
+        return data
+
+
+def _persist_audio(data: bytes, sample_rate: int, channels: int) -> Optional[Path]:
+    if not data:
+        return None
+    AUDIO_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    filename = AUDIO_OUTPUT_DIR / f"audio_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.wav"
+    with wave.open(str(filename), "wb") as wav_file:
+        wav_file.setnchannels(channels)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(data)
+    return filename
+
+
+_audio_recorder: Optional[AudioRecorder] = None
+
+def start_audio_capture() -> bool:
+    global _audio_recorder
+    if sd is None:
+        logging.warning("Audio capture requires the sounddevice library.")
+        return False
+    if _audio_recorder is None:
+        _audio_recorder = AudioRecorder()
+    try:
+        _audio_recorder.start()
+        return True
+    except Exception as exc:  # pragma: no cover - hardware dependent
+        logging.warning("Unable to start audio capture: %s", exc)
+        return False
+
+
+def stop_audio_capture() -> Optional[Path]:
+    global _audio_recorder
+    if _audio_recorder is None:
+        return None
+    try:
+        data = _audio_recorder.stop()
+    except Exception as exc:  # pragma: no cover - hardware dependent
+        logging.warning("Unable to stop audio capture: %s", exc)
+        return None
+    file_path = _persist_audio(data, _audio_recorder.sample_rate, _audio_recorder.channels)
+    if file_path:
+        logging.info("Saved audio capture to %s", file_path)
+    return file_path
+
+
+def _is_familiar_match(result) -> bool:
+    if isinstance(result, dict):
+        for key in ("match", "recognized", "familiar", "success", "found"):
+            value = result.get(key)
+            if isinstance(value, bool):
+                return value
+        return bool(result)
+    return bool(result)
+
 
 def preprocess_frame(frame):
     """preprocess video frame to reduce noise and normalize to grayscale"""
@@ -63,7 +163,7 @@ class SceneChangeDetector:
     def __init__(
         self,
         intensity_threshold: float = 35.0,
-        change_ratio: float = 0.50,
+        change_ratio: float = 0.67,
         smoothing: int = 5,
     ):
         self.intensity_threshold = intensity_threshold
@@ -105,12 +205,6 @@ class SceneChangeDetector:
 
 # constantly running and processing live webcam feed
 def webcam_processing(camera_source=0, display_window: bool = False):
-    """Continuously read from the webcam, preprocess, and react to scene changes.
-
-    Args:
-        camera_source: Index or path to the camera device.
-        display_window: Whether to show a live window via OpenCV highgui.
-    """
     cap = cv2.VideoCapture(camera_source)
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open camera source {camera_source!r}")
@@ -118,27 +212,19 @@ def webcam_processing(camera_source=0, display_window: bool = False):
     scene_detector = SceneChangeDetector()
     frames_buffer: list[np.ndarray] = []
     period_start = time.time()
+    was_face_detected = False
+    capturing_audio = False
     # reads frames from webcam and projects
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         # preprocess live video feed
-        frame, gray = preprocess_frame(frame)
-
-        #print("preprocessed frame", frame)
-        if display_window:
-            try:
-                cv2.imshow("BRIO feed", frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-            except cv2.error as exc:
-                logging.warning("Disabling display due to OpenCV error: %s", exc)
-                display_window = False
+        frame, gray_scaled_frame = preprocess_frame(frame)
 
         # only record frames when significant scene change is detected
-        if scene_detector.detect(frame, gray):
-            print("detected scene change", frame)
+        if scene_detector.detect(frame, gray_scaled_frame):
+            print("detected scene change")
             frames_buffer.append(frame.copy())
 
         if frames_buffer and (time.time() - period_start) >= 3600:
@@ -146,11 +232,39 @@ def webcam_processing(camera_source=0, display_window: bool = False):
             frames_buffer.clear()
             period_start = time.time()
 
-        # if familiar face detected, run the facial recognition process and record conversation
-        if face_detected(frame):
-            process_face(frame)
-        else:
-            continue
+
+        face_present = face_detected(gray_scaled_frame)
+        if face_present and not was_face_detected:
+            snapshot = frame.copy()
+            familiar_result = None
+            try:
+                familiar_result = find_familiar(snapshot)
+                logging.info("Familiar face check: %s", familiar_result)
+            except Exception as exc:
+                logging.warning("find_familiar failed: %s", exc)
+            if familiar_result and not capturing_audio and _is_familiar_match(familiar_result):
+                START_TALKING_FLAG = True
+                if start_audio_capture():
+                    capturing_audio = True
+                    logging.info("Audio capture engaged for familiar face.")
+                # else:
+                #     stop_audio_capture()
+                #     capturing_audio = False
+                #     START_TALKING_FLAG = False
+        if capturing_audio and not audio_detected():
+            stop_audio_capture()
+            capturing_audio = False
+            START_TALKING_FLAG = False
+        was_face_detected = face_present
+
+        # while face_detected(gray_scaled_frame) and audio_detected():
+        #     print("SOMEONE IS SPEAKING: familiar face and audio detected")
+        #     detection_flag = true
+        #     recording_audio()
+        # if detection_flag == true:
+        #     recording_audio(frame)
+        # else:
+        #     continue
 
     if frames_buffer:
         process_frame_batch(frames_buffer)
@@ -222,37 +336,170 @@ def process_frame_batch(frames):
     record_frames(frames, summary)
 
 def record_frames(frames, summary):
-    append_timeline_event(summary)
+    pass
 
-#facial similarity check
-def face_detected(frame):
-    #detect face in frame using deepface library
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    try:
-        detections = DeepFace.extract_faces(
-            img_path=rgb_frame,
-            detector_backend="retinaface",
-            enforce_detection=False,
-        )
-    except Exception as exc:
-        print(f"DeepFace detection error: {exc}")
+#facial similarity check and recognition
+def face_detected(gray_frame):
+    if FACE_CASCADE.empty():
+        logging.warning("OpenCV Haar cascade failed to load; skipping face detection.")
         return False
 
-    has_face = bool(detections)
+    detections = FACE_CASCADE.detectMultiScale(
+        gray_frame,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(30, 30),
+        flags=cv2.CASCADE_SCALE_IMAGE,
+    )
+
+    has_face = len(detections) > 0
     if has_face:
-        print(True)
+        logging.debug("Detected %d face(s) in current frame.", len(detections))
     return has_face
 
     #compare with similarity from database recorded facial profiles
 
-#run live audio processing, send to LLM for summarization, process text, store
-def process_face(frame):
+
+def find_familiar(snapshot: np.ndarray):
+    ok, encoded = cv2.imencode(".jpg", snapshot)
+    if not ok:
+        raise RuntimeError("Failed to encode snapshot for familiar-face lookup.")
+
+    files = {
+        "image": ("snapshot.jpg", encoded.tobytes(), "image/jpeg"),
+    }
+    headers = {"ngrok-skip-browser-warning": "true"}
+    response = requests.post(
+        _FAMILIAR_URL,
+        headers=headers,
+        files=files,
+        timeout=20,
+    )
+    response.raise_for_status()
+    try:
+        return response.json()
+    except ValueError:
+        text = response.text.strip()
+        return {"raw": text} if text else {}
+
+
+#speech detection class using WebRTC VAD (ONLY DETECTS PRESENCE OF SPEECH)
+class _VadSpeechDetector:
+    def __init__(
+        self,
+        sample_rate: int = 16_000,
+        frame_duration_ms: int = 30,
+        #voice detection sensitivity level
+        aggressiveness: int = 3,
+        #length of silence to consider the user as not speaking
+        max_silence_ms: int = 3000,
+    ):
+        if webrtcvad is None:
+            raise RuntimeError("webrtcvad library not available.")
+        #audio format parameters and settings
+        self.sample_rate = sample_rate
+        self.frame_duration_ms = frame_duration_ms
+        self.frame_samples = int(sample_rate * frame_duration_ms / 1000)
+        self.frame_bytes = self.frame_samples * 2  # int16
+        self.max_silence_frames = max(int(max_silence_ms / frame_duration_ms), 1)
+        self._vad = webrtcvad.Vad(min(max(aggressiveness, 0), 3))
+        self._queue: queue.Queue[bytes] = queue.Queue()
+        self._stream: Optional[sd.InputStream] = None
+        self._silence_counter = 0
+        self._is_speaking = False
+        self._ensure_stream()
+    #MAIN FUNCTION retrieving audio frames ACTIVELY from the audio stream
+    def _audio_callback(self, indata, frames, _time, status):
+        if status:
+            logging.debug("Audio stream status: %s", status)
+        self._queue.put(bytes(indata))
+
+    #ensure that the audio stream is active and running, if not start it
+    def _ensure_stream(self):
+        if sd is None:
+            logging.warning(
+                "sounddevice library not available; skipping audio monitoring startup."
+            )
+            return
+        if self._stream is not None and self._stream.active:
+            return
+        try:
+            self._stream = sd.InputStream(
+                samplerate=self.sample_rate,
+                blocksize=self.frame_samples,
+                dtype="int16",
+                channels=1,
+                callback=self._audio_callback,
+            )
+            self._stream.start()
+            logging.info("Audio monitoring stream started.")
+        except Exception as exc:
+            logging.warning("Unable to start audio stream: %s", exc)
+            self._stream = None
+    #pull frames out of the callback queue (queue actively receiving audio frames)
+    #and run VAD to determine if the user is speaking
+    def _process_queue(self):
+        updated_speaking_state = self._is_speaking
+        while not self._queue.empty():
+            chunk = self._queue.get()
+            if len(chunk) < self.frame_bytes:
+                # pad short frames (e.g., last partial frame) with zeros
+                chunk = chunk + b"\x00" * (self.frame_bytes - len(chunk))
+            is_speech = self._vad.is_speech(chunk, self.sample_rate)
+
+            if is_speech:
+                self._silence_counter = 0
+                updated_speaking_state = True
+            elif self._is_speaking:
+                self._silence_counter += 1
+                if self._silence_counter >= self.max_silence_frames:
+                    updated_speaking_state = False
+                    self._silence_counter = 0
+                else:
+                    updated_speaking_state = True
+
+        self._is_speaking = updated_speaking_state
+    #check if the user is speaking, handles micro silencing
+    def is_speaking(self) -> bool:
+        if sd is None or webrtcvad is None:
+            logging.warning(
+                "Audio detection disabled; install sounddevice and webrtcvad."
+            )
+            return False
+        if self._stream is None:
+            self._ensure_stream()
+        if self._stream is None:
+            return False
+        self._process_queue()
+        return self._is_speaking
+
+
+_speech_detector: Optional[_VadSpeechDetector] = None
+
+
+def audio_detected() -> bool:
+    global _speech_detector
+    if _speech_detector is None:
+        if sd is None or webrtcvad is None:
+            logging.warning(
+                "audio_detected requires sounddevice and webrtcvad; returning False."
+            )
+            return False
+        _speech_detector = _VadSpeechDetector()
+    return _speech_detector.is_speaking()
+
+#run live audio processing and transcription appending to current conversation
+def recording_audio(frame):
     #process face in frame
     pass
 
+#send to LLM for summarization, process text, store
+def process_text(text):
+    pass
 
 def record_frame(frame):
-    append_timeline_event("frame captured")
+    #record frame to database
+    pass
 
 
 def main():

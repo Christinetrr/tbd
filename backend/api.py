@@ -1,11 +1,31 @@
 import base64
 import os
+from pathlib import Path
 
 from typing import Iterable
 
 import cv2
 import numpy as np
 from openai import OpenAI
+
+
+def _load_env_from_file():
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        os.environ.setdefault(key, value)
+
+
+_load_env_from_file()
 
 _xai_api_key = os.getenv("GROK_API_KEY")
 if not _xai_api_key:
