@@ -37,9 +37,14 @@ import threading
 import wave
 
 try:
-    from .api import summarize_frames
+    from .api import summarize_frames, summarize_audio
 except ImportError:  # pragma: no cover - allows running as script
-    from api import summarize_frames
+    from api import summarize_frames, summarize_audio
+
+try:
+    from .db import add_conversation, ensure_profile
+except ImportError:  # pragma: no cover - allows running as script
+    from db import add_conversation, ensure_profile
 
 #initialize face cascade
 FACE_CASCADE = cv2.CascadeClassifier(
@@ -49,6 +54,9 @@ _FAMILIAR_URL = "https://64aa23c1f114.ngrok-free.app/recognize"
 AUDIO_OUTPUT_DIR = Path(__file__).resolve().parent / "recordings"
 
 START_TALKING_FLAG = False
+ACTIVE_PROFILE_CONTEXT: Optional[dict] = None
+LAST_RECOGNIZED_ID: Optional[str] = None
+LAST_ANNOUNCED_ID: Optional[str] = None
 
 
 class AudioRecorder:
@@ -205,6 +213,7 @@ class SceneChangeDetector:
 
 # constantly running and processing live webcam feed
 def webcam_processing(camera_source=0, display_window: bool = False):
+    global START_TALKING_FLAG, ACTIVE_PROFILE_CONTEXT, LAST_RECOGNIZED_ID, LAST_ANNOUNCED_ID
     cap = cv2.VideoCapture(camera_source)
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open camera source {camera_source!r}")
@@ -242,29 +251,31 @@ def webcam_processing(camera_source=0, display_window: bool = False):
                 logging.info("Familiar face check: %s", familiar_result)
             except Exception as exc:
                 logging.warning("find_familiar failed: %s", exc)
+            
             if familiar_result and not capturing_audio and _is_familiar_match(familiar_result):
                 START_TALKING_FLAG = True
+                ACTIVE_PROFILE_CONTEXT = _extract_profile_context(familiar_result)
+                identity_key = _context_identity(ACTIVE_PROFILE_CONTEXT)
+                if identity_key and identity_key != LAST_RECOGNIZED_ID:
+                    _announce_identity(ACTIVE_PROFILE_CONTEXT)
+                    LAST_ANNOUNCED_ID = identity_key
+                if identity_key:
+                    LAST_RECOGNIZED_ID = identity_key
                 if start_audio_capture():
                     capturing_audio = True
                     logging.info("Audio capture engaged for familiar face.")
-                # else:
-                #     stop_audio_capture()
-                #     capturing_audio = False
-                #     START_TALKING_FLAG = False
+                else:
+                    stop_audio_capture()
+                    capturing_audio = False
+                    START_TALKING_FLAG = False
+                    ACTIVE_PROFILE_CONTEXT = None
         if capturing_audio and not audio_detected():
-            stop_audio_capture()
+            audio_file = stop_audio_capture()
             capturing_audio = False
             START_TALKING_FLAG = False
+            _process_captured_audio(ACTIVE_PROFILE_CONTEXT, audio_file)
+            ACTIVE_PROFILE_CONTEXT = None
         was_face_detected = face_present
-
-        # while face_detected(gray_scaled_frame) and audio_detected():
-        #     print("SOMEONE IS SPEAKING: familiar face and audio detected")
-        #     detection_flag = true
-        #     recording_audio()
-        # if detection_flag == true:
-        #     recording_audio(frame)
-        # else:
-        #     continue
 
     if frames_buffer:
         process_frame_batch(frames_buffer)
@@ -500,6 +511,83 @@ def process_text(text):
 def record_frame(frame):
     #record frame to database
     pass
+
+
+def _extract_profile_context(result: dict) -> Optional[dict]:
+    if not isinstance(result, dict):
+        return None
+    context = {}
+    for key in ("profile_id", "profileId", "id", "_id"):
+        if key in result and result[key]:
+            context["profile_id"] = result[key]
+            break
+    for key in ("name", "label", "person", "identity"):
+        if key in result and result[key]:
+            context["name"] = result[key]
+            break
+    relation = result.get("relation") or result.get("relationship")
+    if relation:
+        context["relation"] = relation
+    return context or None
+
+
+def _store_conversation_summary(context: Optional[dict], summary: str) -> None:
+    if not summary:
+        return
+    profile_id = None
+    relation = None
+    name = None
+    if context:
+        profile_id = context.get("profile_id")
+        name = context.get("name")
+        relation = context.get("relation")
+    if profile_id:
+        try:
+            add_conversation(profile_id, summary)
+            return
+        except ValueError:
+            logging.warning("Profile id %s not found; attempting to create by name.", profile_id)
+    if name:
+        profile = ensure_profile(name, relation or "unknown")
+        add_conversation(profile["_id"], summary)
+    else:
+        logging.warning("Unable to associate summary with a profile; missing identity info.")
+
+
+def _process_captured_audio(context: Optional[dict], file_path: Optional[Path]) -> None:
+    if file_path is None:
+        return
+    try:
+        with open(file_path, "rb") as audio_file:
+            summary = summarize_audio(audio_file)
+    except Exception as exc:  # pragma: no cover - depends on external APIs
+        logging.warning("Failed to summarize audio %s: %s", file_path, exc)
+        return
+    _store_conversation_summary(context, summary)
+
+
+def _context_identity(context: Optional[dict]) -> Optional[str]:
+    if not context:
+        return None
+    profile_id = context.get("profile_id") if isinstance(context, dict) else None
+    name = context.get("name") if isinstance(context, dict) else None
+    if profile_id:
+        return str(profile_id)
+    if name:
+        return f"name:{name}"
+    return None
+
+
+def _announce_identity(context: Optional[dict]) -> None:
+    if not context:
+        return
+    name = context.get("name") or context.get("label") or "Someone familiar"
+    relation = context.get("relation") or "friend"
+    message = f"This is {name}, and she is your {relation}."
+    try:
+        subprocess.run(["espeak", message], check=False)
+    except FileNotFoundError:
+        logging.warning("espeak not available; cannot announce familiar identity.")
 
 
 def main():

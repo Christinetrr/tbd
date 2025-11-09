@@ -1,11 +1,17 @@
 import os
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 
 from bson import ObjectId
+from dotenv import load_dotenv
 from pymongo import MongoClient, ReturnDocument
 
-_client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+_env_path = Path(__file__).resolve().parent.parent / ".env"
+if _env_path.exists():
+    load_dotenv(_env_path)
+
+_client = MongoClient(os.getenv("MONGO_URI"))
 _db_name = os.getenv("MONGO_DB", "tbd")
 db = _client[_db_name]
 
